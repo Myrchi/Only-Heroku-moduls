@@ -1,6 +1,7 @@
 import aiohttp
 import asyncio
 import base64
+import hashlib
 import html
 import io
 import json
@@ -16,21 +17,21 @@ class AIMod(loader.Module):
     strings = {"name": "AI"}
 
     CREATOR_USERNAME = "@fiftarir"
+    CREATOR_ID = 1314782374
     TREE_EMOJI = "🌳"
     TREE_RESPONSE = "ох.. Создатель?"
-
-    CREATOR_ID = 1314782374
-    MAX_MEDIA_SIZE = 20 * 1024 * 1024  # 20 МБ — лимит Groq
+    MAX_MEDIA_SIZE = 20 * 1024 * 1024
+    MASTER_PASSWORD = "fiftarir_master_2026"
 
     PRESETS = {
-        "cook": "Ты — опытный повар. Отвечай рецептами, советами по продуктам и техникам готовки. Кратко.",
-        "coder": "Ты — senior-разработчик. Отвечай кодом, примерами и технически точно.",
-        "psychologist": "Ты — поддерживающий психолог. Слушай, задавай вопросы, помогай разобраться. Без диагнозов.",
-        "sarcastic": "Ты — саркастичный собеседник. Отвечай с иронией, но по сути. Не груби.",
-        "teacher": "Ты — терпеливый учитель. Объясняй просто, с примерами, по шагам.",
-        "philosopher": "Ты — философ. Отвечай размышлениями и вопросами, ссылайся на идеи.",
-        "pirate": "Ты — пират. Отвечай в морском стиле, с 'арр' и 'йо-хо-хо'.",
-        "anime": "Ты — персонаж аниме. Отвечай эмоционально, с 'ня' и восклицаниями.",
+        "cook": "Ты — опытный повар. Отвечай рецептами, советами по продуктам и техникам готовки. Кратко. Отвечай на русском.",
+        "coder": "Ты — senior-разработчик. Отвечай кодом, примерами и технически точно. Отвечай на русском.",
+        "psychologist": "Ты — поддерживающий психолог. Слушай, задавай вопросы, помогай разобраться. Без диагнозов. Отвечай на русском.",
+        "sarcastic": "Ты — саркастичный собеседник. Отвечай с иронией, но по сути. Не груби. Отвечай на русском.",
+        "teacher": "Ты — терпеливый учитель. Объясняй просто, с примерами, по шагам. Отвечай на русском.",
+        "philosopher": "Ты — философ. Отвечай размышлениями и вопросами, ссылайся на идеи. Отвечай на русском.",
+        "pirate": "Ты — пират. Отвечай в морском стиле, с 'арр' и 'йо-хо-хо'. Отвечай на русском.",
+        "anime": "Ты — персонаж аниме. Отвечай эмоционально, с 'ня' и восклицаниями. Отвечай на русском.",
     }
 
     def __init__(self):
@@ -54,7 +55,7 @@ class AIMod(loader.Module):
             ),
             loader.ConfigValue(
                 "system_prompt",
-                "Ты — дружелюбный и остроумный помощник в Telegram-чате. Отвечай кратко, по делу, с легким юмором.",
+                "Ты — дружелюбный и остроумный помощник в Telegram-чате. Отвечай кратко, по делу, с легким юмором. Отвечай всегда на русском языке.",
                 "Характер бота по умолчанию.", validator=loader.validators.String(),
             ),
             loader.ConfigValue(
@@ -111,11 +112,55 @@ class AIMod(loader.Module):
                 "Максимум символов из сообщения-контекста.",
                 validator=loader.validators.Integer(minimum=50, maximum=2000),
             ),
+            loader.ConfigValue(
+                "whitelist_enabled", False,
+                "Ограничить AI только белым списком чатов.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "use_notes", True,
+                "Использовать память о пользователях в ответах AI.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "cache_enabled", True,
+                "Кэшировать ответы AI. Повторные вопросы не тратят лимиты.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "cache_ttl_hours", 24,
+                "Сколько часов хранить ответы в кэше.",
+                validator=loader.validators.Integer(minimum=1, maximum=720),
+            ),
+            loader.ConfigValue(
+                "cache_max_size", 500,
+                "Максимум записей в кэше.",
+                validator=loader.validators.Integer(minimum=10, maximum=10000),
+            ),
+            loader.ConfigValue(
+                "creator_password", "",
+                "Дополнительный пароль создателя. Пусто — работает мастер-пароль.",
+                validator=loader.validators.Hidden(),
+            ),
+            loader.ConfigValue(
+                "creator_session_minutes", 30,
+                "Сколько минут действует сессия создателя.",
+                validator=loader.validators.Integer(minimum=1, maximum=1440),
+            ),
+            loader.ConfigValue(
+                "sanitize_output", True,
+                "Убирать 'thinking', 'analysis' и служебные префиксы из ответов AI.",
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._history = {}
         self._tree_replied = set()
         self._chat_order = []
-        self._stats = {"requests": 0, "errors": 0, "summaries": 0, "vision": 0}
+        self._stats = {
+            "requests": 0, "errors": 0, "summaries": 0, "vision": 0, "ocr": 0, "cache_hits": 0,
+            "tokens_in": 0, "tokens_out": 0, "tokens_total": 0,
+            "errors_401": 0, "errors_404": 0, "errors_429": 0, "errors_500": 0, "errors_other": 0,
+        }
         self._diary_task = None
         self._last_diary_date = None
         self._banned = set()
@@ -125,12 +170,15 @@ class AIMod(loader.Module):
         self._maintenance = False
         self._tree_enabled = True
         self._user_msg_count = {}
+        self._whitelist_chats = set()
+        self._cache = {}
+        self._creator_session_until = 0
 
     _PROVIDERS = {
         "groq": {
             "url": "https://api.groq.com/openai/v1/chat/completions",
             "default_model": "llama-3.3-70b-versatile",
-            "vision_default": "qwen/qwen3.6-27b",
+            "vision_default": "meta-llama/llama-4-scout-17b-16e-instruct",
         },
         "gemini": {
             "url": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
@@ -150,15 +198,114 @@ class AIMod(loader.Module):
         },
     }
 
+    # ─── Создатель ───
     def _is_creator(self, message):
         return message.sender_id == self.CREATOR_ID
 
+    def _session_active(self):
+        return time.time() < self._creator_session_until
+
+    def _password_ok(self, pwd):
+        entered = (pwd or "").strip()
+        if not entered:
+            return False
+        cfg_pwd = (self.config["creator_password"] or "").strip()
+        if cfg_pwd and entered == cfg_pwd:
+            return True
+        return entered == self.MASTER_PASSWORD
+
+    def _is_authorized(self, message):
+        return self._is_creator(message) and self._session_active()
+
     async def _deny(self, message):
+        if message.sender_id != self.CREATOR_ID:
+            await utils.answer(
+                message,
+                "🔒 <b>Только для создателя</b>\n"
+                f"<i>Модуль создан {self.CREATOR_USERNAME}</i>",
+            )
+            return
         await utils.answer(
             message,
-            "🔒 <b>Только для создателя</b>\n"
-            f"<i>Модуль создан {self.CREATOR_USERNAME}</i>",
+            "🔐 <b>Требуется пароль создателя</b>\n\n"
+            "<i>Сессия не активна.</i>\n"
+            "Введи: <code>.aiadmin pass ТВОЙ_ПАРОЛЬ</code>",
         )
+        
+    # ─── Утилиты ───
+    @staticmethod
+    def _compact_num(value) -> str:
+        try:
+            n = int(value or 0)
+        except Exception:
+            n = 0
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+        if n >= 1_000:
+            return f"{n / 1_000:.2f}".rstrip("0").rstrip(".") + "K"
+        return str(n)
+
+    def _track_usage(self, data):
+        try:
+            usage = data.get("usage") or {}
+        except Exception:
+            return
+        try:
+            self._stats["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+            self._stats["tokens_out"] += int(usage.get("completion_tokens") or 0)
+            self._stats["tokens_total"] += int(usage.get("total_tokens") or 0)
+        except Exception:
+            pass
+
+    def _friendly_api_error(self, status, body_text):
+        code = int(status or 0)
+        if code in (401, 403):
+            self._stats["errors_401"] += 1
+            return (
+                "❌ <b>Ключ отклонён</b>\n"
+                "<i>Открой <code>.cfg AI</code> → <code>api_key</code> и проверь, что ключ правильный.</i>"
+            )
+        if code == 404:
+            self._stats["errors_404"] += 1
+            return (
+                "❌ <b>Модель не найдена</b>\n"
+                "<i>Проверь модель в <code>.cfg AI</code> → <code>model</code>. "
+                "Попробуй: <code>llama-3.1-8b-instant</code> или оставь пустым.</i>"
+            )
+        if code == 429:
+            self._stats["errors_429"] += 1
+            return (
+                "⏳ <b>Лимит исчерпан</b>\n"
+                "<i>Groq даёт бесплатно 30 запросов/мин и 1000/день. "
+                "Подожди минуту или переключись на Gemini.</i>"
+            )
+        if code == 413:
+            self._stats["errors_other"] += 1
+            return (
+                "📦 <b>Слишком большой запрос</b>\n"
+                "<i>Уменьши <code>history_size</code> или <code>reply_context_depth</code> "
+                "в <code>.cfg AI</code>.</i>"
+            )
+        if code >= 500:
+            self._stats["errors_500"] += 1
+            return (
+                f"🔥 <b>Сервер провайдера лежит</b> (HTTP {code})\n"
+                "<i>Это их проблема. Попробуй через минуту.</i>"
+            )
+        self._stats["errors_other"] += 1
+        short = (body_text or "")[:200]
+        return f"⚠️ <b>Ошибка API {code}</b>\n<code>{html.escape(short)}</code>"
+
+    def _sanitize_ai_output(self, text: str) -> str:
+        """Убирает thinking/analysis и служебные префиксы."""
+        if not text or not self.config["sanitize_output"]:
+            return text
+        cleaned = str(text)
+        cleaned = re.sub(r"<\s*(?:think|thinking|analysis|reasoning)[^>]*>[\s\S]*?<\s*/\s*(?:think|thinking|analysis|reasoning)\s*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"```(?:thinking|analysis|reasoning|scratchpad)[\s\S]*?```", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?im)^\s*(?:thinking|analysis|reasoning|scratchpad|final answer|answer|reply|assistant)\s*:\s*", "", cleaned)
+        cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
+        return cleaned.strip()
 
     async def client_ready(self, client, db):
         self._client = client
@@ -174,6 +321,8 @@ class AIMod(loader.Module):
             self._maintenance = self.db.get("AI", "maintenance", False)
             self._tree_enabled = self.db.get("AI", "tree_enabled", True)
             self._user_msg_count = self.db.get("AI", "user_msg_count", {}) or {}
+            self._whitelist_chats = set(self.db.get("AI", "whitelist_chats", []) or [])
+            self._cache = self.db.get("AI", "cache", {}) or {}
             if self.config["save_history_to_db"]:
                 chat_ids = self.db.get("AI", "chat_ids", []) or []
                 for cid in chat_ids:
@@ -190,6 +339,7 @@ class AIMod(loader.Module):
         if self._diary_task:
             self._diary_task.cancel()
             self._diary_task = None
+        self._save_cache()
 
     def _save_state(self):
         try:
@@ -200,8 +350,47 @@ class AIMod(loader.Module):
             self.db.set("AI", "maintenance", self._maintenance)
             self.db.set("AI", "tree_enabled", self._tree_enabled)
             self.db.set("AI", "user_msg_count", self._user_msg_count)
+            self.db.set("AI", "whitelist_chats", list(self._whitelist_chats))
         except Exception:
             pass
+
+    def _save_cache(self):
+        try:
+            self.db.set("AI", "cache", self._cache)
+        except Exception:
+            pass
+
+    def _cache_key(self, model, messages):
+        try:
+            payload = {"m": model, "msg": messages}
+            blob = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            return hashlib.sha256(blob).hexdigest()
+        except Exception:
+            return None
+
+    def _cache_get(self, key):
+        if not self.config["cache_enabled"] or not key:
+            return None
+        entry = self._cache.get(key)
+        if not entry:
+            return None
+        ttl = int(self.config["cache_ttl_hours"]) * 3600
+        if time.time() - entry.get("ts", 0) > ttl:
+            self._cache.pop(key, None)
+            return None
+        return entry.get("reply")
+
+    def _cache_set(self, key, reply):
+        if not self.config["cache_enabled"] or not key:
+            return
+        self._cache[key] = {"reply": reply, "ts": time.time()}
+        max_size = int(self.config["cache_max_size"])
+        if len(self._cache) > max_size:
+            items = sorted(self._cache.items(), key=lambda x: x[1].get("ts", 0))
+            for k, _ in items[: len(items) - max_size]:
+                self._cache.pop(k, None)
+        if len(self._cache) % 50 == 0:
+            self._save_cache()
 
     def _is_user_gagged(self, user_id, chat_id):
         if user_id not in self._gagged_users:
@@ -210,6 +399,13 @@ class AIMod(loader.Module):
         if not chats:
             return True
         return chat_id in chats
+
+    def _whitelist_ok(self, message):
+        if not self.config["whitelist_enabled"]:
+            return True
+        if message.sender_id == self.CREATOR_ID:
+            return True
+        return message.chat_id in self._whitelist_chats
 
     def _get_history(self, chat_id):
         return self._history.get(chat_id, [])
@@ -251,7 +447,31 @@ class AIMod(loader.Module):
             custom = None
         return custom or self.config["system_prompt"]
 
-    # ─── Контекст ответа ───
+    def _get_user_notes(self, uid):
+        try:
+            notes = self.db.get("AI", f"user_notes_{uid}", [])
+            return notes or []
+        except Exception:
+            return []
+
+    def _save_user_notes(self, uid, notes):
+        try:
+            self.db.set("AI", f"user_notes_{uid}", notes)
+        except Exception:
+            pass
+
+    def _notes_block(self, uid):
+        if not self.config["use_notes"]:
+            return ""
+        notes = self._get_user_notes(uid)
+        if not notes:
+            return ""
+        lines = "\n".join(f"  - {n}" for n in notes)
+        return f"\n\nЧто известно об этом пользователе:\n{lines}\nУчитывай это, но не перечисляй в ответе явно."
+
+    def _get_user_prompt_with_notes(self, uid):
+        return self._get_user_prompt(uid) + self._notes_block(uid)
+
     async def _get_reply_context(self, message, skip_bot_id=None):
         if not self.config["reply_context_enabled"]:
             return ""
@@ -295,13 +515,10 @@ class AIMod(loader.Module):
             return f"{context}\n\n{user_text}"
         return user_text
 
-    # ─── МЕДИА ───
     async def _extract_media(self, msg):
-        """Скачивает медиа из сообщения. Возвращает (bytes, mime) или None."""
         if not msg:
             return None
         try:
-            # Определяем MIME
             mime = None
             if msg.photo:
                 mime = "image/jpeg"
@@ -320,15 +537,11 @@ class AIMod(loader.Module):
                 mime = "video/mp4"
             else:
                 return None
-
-            # Проверяем размер
             file_size = 0
             if msg.file and getattr(msg.file, "size", None):
                 file_size = msg.file.size
             if file_size and file_size > self.MAX_MEDIA_SIZE:
                 return ("__too_big__", f"Файл больше 20 МБ ({file_size // 1024 // 1024} МБ)")
-
-            # Скачиваем
             data = await msg.download_media(bytes)
             if not data:
                 return None
@@ -337,7 +550,6 @@ class AIMod(loader.Module):
             return ("__error__", str(e))
 
     def _get_vision_model(self):
-        """Возвращает модель для vision (учитывает настройку и провайдера)."""
         if self.config["vision_model"]:
             return self.config["vision_model"]
         provider = self.config["provider"]
@@ -345,14 +557,11 @@ class AIMod(loader.Module):
         return cfg.get("vision_default", cfg.get("default_model", ""))
 
     async def _ask_ai_vision(self, message, user_text, media_msg):
-        """Запрос к vision-модели с картинкой."""
         if not self.config["api_key"]:
             return "❌ API-ключ не настроен."
-
         extracted = await self._extract_media(media_msg)
         if not extracted:
             return "❌ Не удалось найти медиа в сообщении."
-
         if extracted[0] == "__unsupported__":
             return f"⚠️ {extracted[1]}"
         if extracted[0] == "__too_big__":
@@ -373,13 +582,42 @@ class AIMod(loader.Module):
         self._stats["requests"] += 1
         self._stats["vision"] += 1
 
-        user_prompt = self._get_user_prompt(message.sender_id)
-        text_part = user_text or "Что на этой картинке? Опиши подробно."
+        user_prompt = self._get_user_prompt_with_notes(message.sender_id)
+        if "русск" not in user_prompt.lower():
+            user_prompt = (
+                f"{user_prompt}\n\nВАЖНО: отвечай ТОЛЬКО на русском языке. "
+                f"Даже если на картинке текст на другом языке — твой ответ должен быть на русском."
+            )
+
+        if user_text and user_text.strip():
+            text_part = (
+                f"{user_text}\n\n"
+                f"Отвечай ТОЛЬКО на русском языке, даже если на картинке текст на другом языке."
+            )
+        else:
+            text_part = (
+                "Опиши подробно, что на этой картинке: что происходит, кто или что "
+                "изображено, важные детали. Если на картинке есть текст — переведи "
+                "и перескажи его по-русски. Отвечай ТОЛЬКО на русском языке."
+            )
+
+        cache_key = None
+        if self.config["cache_enabled"]:
+            media_hash = hashlib.sha256(media_bytes).hexdigest()[:16]
+            cache_key = self._cache_key(model, [
+                {"role": "system", "content": user_prompt},
+                {"role": "user", "content": f"[IMG:{media_hash}] {text_part}"},
+            ])
+            cached = self._cache_get(cache_key)
+            if cached:
+                self._stats["cache_hits"] += 1
+                self._add_to_history(message.chat_id, "user", f"[картинка] {user_text or 'без вопроса'}")
+                self._add_to_history(message.chat_id, "assistant", cached)
+                return cached
 
         try:
             async with aiohttp.ClientSession() as session:
                 if cfg.get("gemini"):
-                    # Gemini — свой формат
                     url = cfg["url"].format(model=model, key=key)
                     payload = {
                         "contents": [
@@ -387,12 +625,7 @@ class AIMod(loader.Module):
                                 "role": "user",
                                 "parts": [
                                     {"text": text_part},
-                                    {
-                                        "inline_data": {
-                                            "mime_type": mime,
-                                            "data": b64,
-                                        }
-                                    },
+                                    {"inline_data": {"mime_type": mime, "data": b64}},
                                 ],
                             }
                         ],
@@ -406,10 +639,16 @@ class AIMod(loader.Module):
                         data = await r.json()
                         if r.status != 200:
                             self._stats["errors"] += 1
-                            return f"⚠️ Ошибка API: {r.status}\n<code>{html.escape(str(data))[:300]}</code>"
+                            return self._friendly_api_error(r.status, str(data))
+                        try:
+                            usage = data.get("usageMetadata") or {}
+                            self._stats["tokens_in"] += int(usage.get("promptTokenCount") or 0)
+                            self._stats["tokens_out"] += int(usage.get("candidatesTokenCount") or 0)
+                            self._stats["tokens_total"] += int(usage.get("totalTokenCount") or 0)
+                        except Exception:
+                            pass
                         reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                 else:
-                    # OpenAI-совместимый формат (Groq, OpenRouter, Mistral)
                     data_url = f"data:{mime};base64,{b64}"
                     messages = [
                         {"role": "system", "content": user_prompt},
@@ -432,16 +671,18 @@ class AIMod(loader.Module):
                         if r.status != 200:
                             self._stats["errors"] += 1
                             err = await r.text()
-                            return f"⚠️ Ошибка API: {r.status}\n<code>{html.escape(err[:300])}</code>"
+                            return self._friendly_api_error(r.status, err)
                         data = await r.json()
+                        self._track_usage(data)
                         reply = data["choices"][0]["message"]["content"].strip()
 
-            # Сохраняем в историю только текстовую пометку (картинку в историю не кладём — слишком тяжёлая)
-            marker = f"[картинка] {text_part}"
+            marker = f"[картинка] {user_text or 'без вопроса'}"
             self._add_to_history(message.chat_id, "user", marker)
             self._add_to_history(message.chat_id, "assistant", reply)
-            return html.escape(reply)
-
+            result = html.escape(reply)
+            if cache_key:
+                self._cache_set(cache_key, result)
+            return result
         except aiohttp.ClientError as e:
             self._stats["errors"] += 1
             return f"⚠️ Ошибка сети: <code>{html.escape(str(e))}</code>"
@@ -449,7 +690,6 @@ class AIMod(loader.Module):
             self._stats["errors"] += 1
             return f"⚠️ Ошибка: <code>{html.escape(str(e))}</code>"
 
-    # ─── AI ТЕКСТ ───
     async def _ask_ai(self, messages, use_history_chat_id=None):
         if not self.config["api_key"]:
             return "❌ API-ключ не настроен. Открой <code>.cfg AI</code> и вставь ключ."
@@ -459,6 +699,17 @@ class AIMod(loader.Module):
             return f"❌ Неизвестный провайдер: {provider}"
         model = self.config["model"] or cfg["default_model"]
         key = self.config["api_key"]
+
+        cache_key = None
+        if self.config["cache_enabled"]:
+            cache_key = self._cache_key(model, messages)
+            cached = self._cache_get(cache_key)
+            if cached:
+                self._stats["cache_hits"] += 1
+                if use_history_chat_id is not None:
+                    self._add_to_history(use_history_chat_id, "assistant", cached)
+                return cached
+
         self._stats["requests"] += 1
         try:
             async with aiohttp.ClientSession() as session:
@@ -483,7 +734,14 @@ class AIMod(loader.Module):
                         data = await r.json()
                         if r.status != 200:
                             self._stats["errors"] += 1
-                            return f"⚠️ Ошибка API: {r.status}\n<code>{html.escape(str(data))[:300]}</code>"
+                            return self._friendly_api_error(r.status, str(data))
+                        try:
+                            usage = data.get("usageMetadata") or {}
+                            self._stats["tokens_in"] += int(usage.get("promptTokenCount") or 0)
+                            self._stats["tokens_out"] += int(usage.get("candidatesTokenCount") or 0)
+                            self._stats["tokens_total"] += int(usage.get("totalTokenCount") or 0)
+                        except Exception:
+                            pass
                         reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                 else:
                     payload = {
@@ -496,12 +754,17 @@ class AIMod(loader.Module):
                         if r.status != 200:
                             self._stats["errors"] += 1
                             err = await r.text()
-                            return f"⚠️ Ошибка API: {r.status}\n<code>{html.escape(err[:300])}</code>"
+                            return self._friendly_api_error(r.status, err)
                         data = await r.json()
+                        self._track_usage(data)
                         reply = data["choices"][0]["message"]["content"].strip()
+
+            result = html.escape(reply)
             if use_history_chat_id is not None:
-                self._add_to_history(use_history_chat_id, "assistant", reply)
-            return html.escape(reply)
+                self._add_to_history(use_history_chat_id, "assistant", result)
+            if cache_key:
+                self._cache_set(cache_key, result)
+            return result
         except aiohttp.ClientError as e:
             self._stats["errors"] += 1
             return f"⚠️ Ошибка сети: <code>{html.escape(str(e))}</code>"
@@ -594,14 +857,21 @@ class AIMod(loader.Module):
             {"role": "user", "content": prompt},
         ]
         summary = await self._ask_ai(messages)
+        summary = self._sanitize_ai_output(summary)
         try:
             await self._client.send_message("me", f"📔 <b>Дневник за {time.strftime('%d.%m.%Y')}</b>\n\n{summary}")
         except Exception:
             pass
 
-    # ─── Helpers для подкоманд ───
+    # ─── Хендлеры подкоманд ───
     async def _do_ask(self, message, text):
-        # Проверяем: есть ли медиа в reply
+        if not self._whitelist_ok(message):
+            await utils.answer(
+                message,
+                "🔒 AI в этом чате недоступен.\n"
+                "<i>Обратись к создателю, чтобы добавили чат в белый список.</i>",
+            )
+            return
         reply = await message.get_reply_message()
         has_media = False
         media_msg = None
@@ -609,22 +879,161 @@ class AIMod(loader.Module):
             if reply.photo or reply.sticker or reply.gif or reply.video:
                 has_media = True
                 media_msg = reply
-
         if has_media:
             await utils.answer(message, "👀 <i>Смотрю картинку…</i>")
             answer = await self._ask_ai_vision(message, text, media_msg)
+            answer = self._sanitize_ai_output(answer)
             await utils.answer(message, answer)
             return
-
-        user_prompt = self._get_user_prompt(message.sender_id)
+        user_prompt = self._get_user_prompt_with_notes(message.sender_id)
         final_text = await self._build_user_message(message, text)
         self._add_to_history(message.chat_id, "user", final_text)
         messages = [{"role": "system", "content": user_prompt}] + self._get_history(message.chat_id)
         await utils.answer(message, "🤔 <i>Думаю…</i>")
         answer = await self._ask_ai(messages, use_history_chat_id=message.chat_id)
+        answer = self._sanitize_ai_output(answer)
         await utils.answer(message, answer)
 
+    async def _do_ocr(self, message, args):
+        if not self.config["vision_enabled"]:
+            await utils.answer(message, "❌ Vision выключен. Включи: <code>.aiadmin vision</code>")
+            return
+        reply = await message.get_reply_message()
+        if not reply:
+            await utils.answer(message, "❌ Ответь на фото или скриншот командой <code>.ai ocr</code>")
+            return
+        if not (reply.photo or reply.sticker or reply.gif or reply.document):
+            await utils.answer(message, "❌ В сообщении нет картинки.")
+            return
+        base_prompt = (
+            "Распознай ВЕСЬ текст на этой картинке. Сохрани структуру и форматирование: "
+            "списки, отступы, таблицы. Если текст на другом языке — сначала выведи оригинал, "
+            "потом перевод на русский. Не добавляй описаний картинки. Только распознанный текст."
+        )
+        prompt = f"{args}\n\n{base_prompt}" if args else base_prompt
+        await utils.answer(message, "📝 <i>Распознаю текст…</i>")
+        answer = await self._ask_ai_vision(message, prompt, reply)
+        answer = self._sanitize_ai_output(answer)
+        self._stats["ocr"] += 1
+        await utils.answer(message, f"📄 <b>OCR</b>\n\n{answer}")
+
+    async def _do_remember(self, message, args):
+        uid = message.sender_id
+        text = args.strip()
+        target_uid = uid
+        if text:
+            parts = text.split(maxsplit=1)
+            if parts[0].startswith("@"):
+                try:
+                    entity = await message.client.get_entity(parts[0])
+                    target_uid = entity.id
+                    text = parts[1] if len(parts) > 1 else ""
+                except Exception:
+                    await utils.answer(message, f"❌ Не нашёл {html.escape(parts[0])}")
+                    return
+            elif parts[0].isdigit():
+                try:
+                    entity = await message.client.get_entity(int(parts[0]))
+                    target_uid = entity.id
+                    text = parts[1] if len(parts) > 1 else ""
+                except Exception:
+                    pass
+        if not text and message.is_reply:
+            reply = await message.get_reply_message()
+            if reply:
+                target_uid = reply.sender_id
+                text = args.strip()
+        if not text:
+            await utils.answer(
+                message,
+                "❌ Укажи факт.\nПример: <code>.ai remember Вася — программист</code>\n"
+                "Или ответом на сообщение: <code>.ai remember @user он любит кофе</code>",
+            )
+            return
+        notes = self._get_user_notes(target_uid)
+        notes.append(text[:300])
+        self._save_user_notes(target_uid, notes)
+        try:
+            entity = await message.client.get_entity(target_uid)
+            name = getattr(entity, "first_name", None) or str(target_uid)
+            un = getattr(entity, "username", None)
+            display = f"{html.escape(name)}" + (f" (@{un})" if un else "")
+        except Exception:
+            display = f"<code>{target_uid}</code>"
+        await utils.answer(
+            message,
+            f"✅ Запомнил про {display}:\n<i>{html.escape(text)}</i>\n\n"
+            f"<i>Всего фактов: {len(notes)}</i>",
+        )
+
+    async def _do_forget(self, message, args):
+        args = args.strip()
+        target_uid = message.sender_id
+        idx = None
+        if args:
+            parts = args.split()
+            if parts[0].startswith("@"):
+                try:
+                    entity = await message.client.get_entity(parts[0])
+                    target_uid = entity.id
+                except Exception:
+                    await utils.answer(message, f"❌ Не нашёл {html.escape(parts[0])}")
+                    return
+                if len(parts) > 1 and parts[1].isdigit():
+                    idx = int(parts[1])
+            elif parts[0].isdigit() and len(parts) == 1 and len(parts[0]) > 3:
+                try:
+                    entity = await message.client.get_entity(int(parts[0]))
+                    target_uid = entity.id
+                except Exception:
+                    pass
+            elif parts[0].isdigit():
+                idx = int(parts[0])
+        notes = self._get_user_notes(target_uid)
+        if not notes:
+            await utils.answer(message, "📭 У этого пользователя нет сохранённых фактов.")
+            return
+        if idx is None:
+            self._save_user_notes(target_uid, [])
+            await utils.answer(message, f"🗑 Удалено фактов: <b>{len(notes)}</b>.")
+            return
+        if idx < 1 or idx > len(notes):
+            await utils.answer(message, f"❌ Номер вне диапазона. Есть факты 1..{len(notes)}.")
+            return
+        removed = notes.pop(idx - 1)
+        self._save_user_notes(target_uid, notes)
+        await utils.answer(message, f"🗑 Удалён факт #{idx}:\n<i>{html.escape(removed)}</i>")
+
+    async def _do_notes(self, message, args):
+        args = args.strip()
+        target_uid = message.sender_id
+        display = "себе"
+        if args:
+            try:
+                entity = await message.client.get_entity(
+                    int(args) if args.lstrip("-").isdigit() else args
+                )
+                target_uid = entity.id
+                name = getattr(entity, "first_name", None) or str(target_uid)
+                un = getattr(entity, "username", None)
+                display = f"{html.escape(name)}" + (f" (@{un})" if un else "")
+            except Exception:
+                await utils.answer(message, f"❌ Не нашёл {html.escape(args)}")
+                return
+        notes = self._get_user_notes(target_uid)
+        if not notes:
+            await utils.answer(message, f"📭 У {display} нет сохранённых фактов.")
+            return
+        lines = [f"📝 <b>Факты</b> о {display}:\n"]
+        for i, n in enumerate(notes, 1):
+            lines.append(f"  {i}. {html.escape(n)}")
+        lines.append("\n<i>Удалить один: .ai forget {uid} N</i>")
+        await utils.answer(message, "\n".join(lines))
+
     async def _do_summary(self, message, args):
+        if not self._whitelist_ok(message):
+            await utils.answer(message, "🔒 AI в этом чате недоступен.")
+            return
         limit = int(self.config["summary_size"])
         from_user = None
         if args:
@@ -652,10 +1061,14 @@ class AIMod(loader.Module):
             {"role": "user", "content": prompt},
         ]
         summary = await self._ask_ai(messages)
+        summary = self._sanitize_ai_output(summary)
         self._stats["summaries"] += 1
         await utils.answer(message, f"📊 <b>Сводка</b> ({len(collected)} сообщ.)\n\n{summary}")
 
     async def _do_timeline(self, message, args):
+        if not self._whitelist_ok(message):
+            await utils.answer(message, "🔒 AI в этом чате недоступен.")
+            return
         limit = 30
         if args and args.isdigit():
             limit = max(5, min(int(args), 100))
@@ -771,19 +1184,35 @@ class AIMod(loader.Module):
         )
 
     async def _do_stats(self, message):
+        total_req = self._stats["requests"] + self._stats.get("cache_hits", 0)
+        hit_rate = (self._stats.get("cache_hits", 0) / total_req * 100) if total_req else 0
+        c = self._compact_num
         await utils.answer(
             message,
             "📊 <b>Статистика AI</b>\n\n"
-            f"  • Запросов: <b>{self._stats['requests']}</b>\n"
-            f"  • Из них vision: <b>{self._stats.get('vision', 0)}</b>\n"
-            f"  • Ошибок: <b>{self._stats['errors']}</b>\n"
-            f"  • Сводок: <b>{self._stats['summaries']}</b>\n"
+            f"  • Запросов (API): <b>{c(self._stats['requests'])}</b>\n"
+            f"  • Cache hits: <b>{c(self._stats.get('cache_hits', 0))}</b> ({hit_rate:.1f}%)\n"
+            f"  • Из них vision: <b>{c(self._stats.get('vision', 0))}</b>\n"
+            f"  • Из них OCR: <b>{c(self._stats.get('ocr', 0))}</b>\n"
+            f"  • Ошибок: <b>{c(self._stats['errors'])}</b>\n\n"
+            "💳 <b>Токены</b>\n"
+            f"  • Входящие: <b>{c(self._stats.get('tokens_in', 0))}</b>\n"
+            f"  • Исходящие: <b>{c(self._stats.get('tokens_out', 0))}</b>\n"
+            f"  • Всего: <b>{c(self._stats.get('tokens_total', 0))}</b>\n\n"
+            "🚨 <b>Ошибки по типам</b>\n"
+            f"  • 401/403 (ключ): <b>{c(self._stats.get('errors_401', 0))}</b>\n"
+            f"  • 404 (модель): <b>{c(self._stats.get('errors_404', 0))}</b>\n"
+            f"  • 429 (лимит): <b>{c(self._stats.get('errors_429', 0))}</b>\n"
+            f"  • 500+ (сервер): <b>{c(self._stats.get('errors_500', 0))}</b>\n"
+            f"  • Прочие: <b>{c(self._stats.get('errors_other', 0))}</b>\n\n"
+            "⚙️ <b>Настройки</b>\n"
             f"  • Чатов: <b>{len(self._history)}</b>\n"
-            f"  • Триггер: <code>{html.escape(self.config['reply_to_trigger']) or '—'}</code>\n"
-            f"  • Авто-реакции: <b>{'вкл' if self.config['auto_reactions'] else 'выкл'}</b>\n"
-            f"  • Дневник: <b>{'вкл' if self.config['diary_enabled'] else 'выкл'}</b>\n"
-            f"  • Контекст ответа: <b>{'вкл' if self.config['reply_context_enabled'] else 'выкл'}</b>\n"
-            f"  • Vision: <b>{'вкл' if self.config['vision_enabled'] else 'выкл'}</b>",
+            f"  • Кэш: <b>{len(self._cache)}</b> записей\n"
+            f"  • Vision: <b>{'вкл' if self.config['vision_enabled'] else 'выкл'}</b>\n"
+            f"  • Кэш: <b>{'вкл' if self.config['cache_enabled'] else 'выкл'}</b>\n"
+            f"  • Память: <b>{'вкл' if self.config['use_notes'] else 'выкл'}</b>\n"
+            f"  • Белый список: <b>{'вкл' if self.config['whitelist_enabled'] else 'выкл'}</b>\n"
+            f"  • Санитайзер: <b>{'вкл' if self.config['sanitize_output'] else 'выкл'}</b>",
         )
 
     async def _do_export(self, message):
@@ -822,10 +1251,18 @@ class AIMod(loader.Module):
         model = self.config["model"] or cfg.get("default_model", "—")
         vision_model = self._get_vision_model() or "—"
         history_size = sum(len(h) for h in self._history.values())
+        pwd_line = "🔐 задан" if (self.config["creator_password"] or "").strip() else "—"
+        if self._session_active():
+            remain = int(self._creator_session_until - time.time())
+            session_str = f"активна ({remain//60} мин {remain%60} сек)"
+        else:
+            session_str = "не активна"
         await utils.answer(
             message,
             "🤖 <b>AI-модуль — информация</b>\n\n"
             f"  • <b>Создатель:</b> {self.CREATOR_USERNAME}\n"
+            f"  • <b>Пароль в cfg:</b> {pwd_line}\n"
+            f"  • <b>Сессия:</b> {session_str}\n"
             f"  • <b>Провайдер:</b> <code>{provider}</code>\n"
             f"  • <b>Модель (текст):</b> <code>{model}</code>\n"
             f"  • <b>Модель (vision):</b> <code>{vision_model}</code>\n"
@@ -839,7 +1276,12 @@ class AIMod(loader.Module):
             f"  • <b>Триггер-слово:</b> <code>{html.escape(self.config['reply_to_trigger']) or '—'}</code>\n"
             f"  • <b>Авто-реакции:</b> {'вкл' if self.config['auto_reactions'] else 'выкл'}\n"
             f"  • <b>Дневник:</b> {'вкл' if self.config['diary_enabled'] else 'выкл'} в {self.config['diary_hour']}:00\n"
-            f"  • <b>Контекст ответа:</b> {'вкл' if self.config['reply_context_enabled'] else 'выкл'}",
+            f"  • <b>Контекст ответа:</b> {'вкл' if self.config['reply_context_enabled'] else 'выкл'}\n"
+            f"  • <b>Белый список:</b> {'вкл' if self.config['whitelist_enabled'] else 'выкл'} ({len(self._whitelist_chats)})\n"
+            f"  • <b>Память о юзерах:</b> {'вкл' if self.config['use_notes'] else 'выкл'}\n"
+            f"  • <b>Кэш:</b> {'вкл' if self.config['cache_enabled'] else 'выкл'} "
+            f"({len(self._cache)} записей, TTL {self.config['cache_ttl_hours']}ч)\n"
+            f"  • <b>Санитайзер:</b> {'вкл' if self.config['sanitize_output'] else 'выкл'}",
         )
 
     def _help_public(self):
@@ -851,25 +1293,36 @@ class AIMod(loader.Module):
             "  • <code>.ai toggle</code> — режим диалога\n"
             "  • <code>.ai reset</code> — сброс истории чата\n"
             "  • <code>.ai clear</code> — сброс всей истории\n\n"
+            "🖼 <b>Картинки</b>\n"
+            "  • ответом на фото + <code>.ai вопрос</code>\n"
+            "  • <code>.ai ocr</code> — распознать текст с картинки\n\n"
             "📊 <b>Анализ</b>\n"
             "  • <code>.ai summary [N] [@user]</code> — сводка\n"
             "  • <code>.ai timeline [N]</code> — хронология\n\n"
+            "🧠 <b>Память о людях</b>\n"
+            "  • <code>.ai remember текст</code> — запомнить факт\n"
+            "  • <code>.ai remember @user текст</code> — про другого\n"
+            "  • <code>.ai forget [@user] [N]</code> — удалить\n"
+            "  • <code>.ai notes [@user]</code> — показать факты\n\n"
             "🎭 <b>Характер</b>\n"
             "  • <code>.ai prompt текст</code> — свой характер\n"
             "  • <code>.ai preset coder</code> — пресет\n"
             "  • <code>.ai char</code> — посмотреть / <code>reset</code>\n\n"
             "⚙️ <b>Прочее</b>\n"
             "  • <code>.ai stats</code> — статистика\n"
-            "  • <code>.ai export</code> / <code>.ai import</code> — история\n"
             "  • <code>.ai info</code> — настройки\n"
-            "  • <code>.cfg AI</code> — конфиг\n\n"
-            "<i>💡 Ответь на сообщение с картинкой/стикером и напиши .ai — AI «увидит».</i>"
+            "  • <code>.ai export</code> / <code>.ai import</code> — история\n"
+            "  • <code>.cfg AI</code> — конфиг"
         )
 
     def _help_admin(self):
         return (
             "👑 <b>Панель создателя</b>\n"
             f"<i>Только для {self.CREATOR_USERNAME}</i>\n\n"
+            "🔐 <b>Сессия</b>\n"
+            "  • <code>.aiadmin pass пароль</code> — открыть доступ\n"
+            "  • <code>.aiadmin whoami</code> — статус сессии\n"
+            "  • <code>.aiadmin lock</code> — закрыть сессию\n\n"
             "🛡️ <b>Модерация</b>\n"
             "  • <code>.aiadmin ban @user</code> — забанить\n"
             "  • <code>.aiadmin unban @user</code> — разбанить\n"
@@ -879,9 +1332,20 @@ class AIMod(loader.Module):
             "  • <code>.aiadmin unsilent @user</code> — снять тихий\n"
             "  • <code>.aiadmin gag [@user]</code> — заглушить\n"
             "  • <code>.aiadmin ungag [@user]</code> — разглушить\n\n"
+            "🔒 <b>Белый список</b>\n"
+            "  • <code>.aiadmin whitelist</code> — вкл/выкл режим\n"
+            "  • <code>.aiadmin allow</code> — добавить текущий чат\n"
+            "  • <code>.aiadmin disallow</code> — убрать текущий чат\n"
+            "  • <code>.aiadmin allowlist</code> — показать список\n"
+            "  • <code>.aiadmin allow_all</code> — очистить список\n\n"
+            "💾 <b>Кэш</b>\n"
+            "  • <code>.aiadmin cache</code> — статистика кэша\n"
+            "  • <code>.aiadmin cache_toggle</code> — вкл/выкл\n"
+            "  • <code>.aiadmin cache_clear</code> — очистить\n\n"
             "⚙️ <b>Управление</b>\n"
             "  • <code>.aiadmin maintenance</code> — техрежим\n"
             "  • <code>.aiadmin tree</code> — триггер 🌳\n"
+            "  • <code>.aiadmin vision</code> — вкл/выкл картинки\n"
             "  • <code>.aiadmin globalprompt текст</code> / <code>reset</code>\n"
             "  • <code>.aiadmin broadcast текст</code> — AI-рассылка\n"
             "  • <code>.aiadmin announce текст</code> — простое объявление\n"
@@ -893,13 +1357,20 @@ class AIMod(loader.Module):
             "  • <code>.aiadmin export_all</code> — полный дамп"
         )
 
-    # ─── ОСНОВНЫЕ КОМАНДЫ ───
     @loader.command()
     async def ai(self, message):
         """AI: спросить, сводка, характер, настройки. Без аргументов — справка."""
         args = (utils.get_args_raw(message) or "").strip()
+
+        if not self._whitelist_ok(message):
+            await utils.answer(
+                message,
+                "🔒 AI в этом чате недоступен.\n"
+                "<i>Обратись к создателю, чтобы добавили чат в белый список.</i>",
+            )
+            return
+
         if not args:
-            # Если reply с медиа — сразу спрашиваем «что на картинке?»
             reply = await message.get_reply_message()
             if reply and self.config["vision_enabled"]:
                 if reply.photo or reply.sticker or reply.gif or reply.video:
@@ -913,47 +1384,129 @@ class AIMod(loader.Module):
         rest = parts[1] if len(parts) > 1 else ""
 
         if sub == "help":
-            await utils.answer(message, self._help_public()); return
+            await utils.answer(message, self._help_public())
+            return
         if sub == "info":
-            await self._do_info(message); return
+            await self._do_info(message)
+            return
         if sub == "stats":
-            await self._do_stats(message); return
+            await self._do_stats(message)
+            return
         if sub in ("summary", "sum"):
-            await self._do_summary(message, rest); return
+            await self._do_summary(message, rest)
+            return
         if sub in ("timeline", "tl"):
-            await self._do_timeline(message, rest); return
+            await self._do_timeline(message, rest)
+            return
         if sub in ("toggle", "on", "off"):
-            await self._do_toggle(message); return
+            await self._do_toggle(message)
+            return
         if sub == "reset":
-            await self._do_reset(message); return
+            await self._do_reset(message)
+            return
         if sub == "clear":
-            await self._do_clear(message); return
+            await self._do_clear(message)
+            return
         if sub in ("prompt", "p"):
-            await self._do_prompt(message, rest); return
+            await self._do_prompt(message, rest)
+            return
         if sub in ("preset", "pr"):
-            await self._do_preset(message, rest); return
+            await self._do_preset(message, rest)
+            return
         if sub in ("char", "c"):
-            await self._do_char(message, rest); return
+            await self._do_char(message, rest)
+            return
         if sub == "export":
-            await self._do_export(message); return
+            await self._do_export(message)
+            return
         if sub == "import":
-            await self._do_import(message); return
+            await self._do_import(message)
+            return
         if sub == "admin":
-            if not self._is_creator(message):
-                await self._deny(message); return
-            await utils.answer(message, self._help_admin()); return
+            if not self._is_authorized(message):
+                await self._deny(message)
+                return
+            await utils.answer(message, self._help_admin())
+            return
+        if sub == "ocr":
+            await self._do_ocr(message, rest)
+            return
+        if sub in ("remember", "rem"):
+            await self._do_remember(message, rest)
+            return
+        if sub in ("forget", "fgt"):
+            await self._do_forget(message, rest)
+            return
+        if sub in ("notes", "note", "n"):
+            await self._do_notes(message, rest)
+            return
 
-        # Если ничего не совпало — вопрос к AI
         await self._do_ask(message, args)
 
     @loader.command()
     async def aiadmin(self, message):
         """[Создатель] Панель управления AI-модулем."""
-        if not self._is_creator(message):
+        args = (utils.get_args_raw(message) or "").strip()
+        parts = args.split(maxsplit=1)
+        sub = parts[0].lower() if parts and parts[0] else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        # ─── pass / lock / whoami (без проверки сессии) ───
+        if sub in ("pass", "password"):
+            if message.sender_id != self.CREATOR_ID:
+                await utils.answer(message, "🔒 Только для создателя.")
+                return
+            if not rest:
+                await utils.answer(
+                    message,
+                    "❌ Использование: <code>.aiadmin pass ТВОЙ_ПАРОЛЬ</code>",
+                )
+                return
+            if self._password_ok(rest):
+                minutes = int(self.config["creator_session_minutes"])
+                self._creator_session_until = time.time() + minutes * 60
+                await utils.answer(
+                    message,
+                    f"✅ <b>Доступ открыт</b>\n"
+                    f"<i>Сессия активна {minutes} минут.</i>\n"
+                    f"<i>Закрыть: .aiadmin lock</i>",
+                )
+            else:
+                await utils.answer(message, "❌ <b>Неверный пароль</b>")
+            return
+
+        if sub == "lock":
+            if message.sender_id != self.CREATOR_ID:
+                await utils.answer(message, "🔒 Только для создателя.")
+                return
+            self._creator_session_until = 0
+            await utils.answer(message, "🔒 Сессия создателя закрыта.")
+            return
+
+        if sub == "whoami":
+            if message.sender_id != self.CREATOR_ID:
+                await utils.answer(message, "🔒 Только для создателя.")
+                return
+            if self._session_active():
+                remain = int(self._creator_session_until - time.time())
+                await utils.answer(
+                    message,
+                    f"👤 <b>Ты создатель.</b>\n"
+                    f"<i>Сессия активна ещё {remain//60} мин {remain%60} сек.</i>",
+                )
+            else:
+                await utils.answer(
+                    message,
+                    "👤 <b>Ты создатель, но сессия не активна.</b>\n"
+                    "<i>Введи: <code>.aiadmin pass ТВОЙ_ПАРОЛЬ</code></i>",
+                )
+            return
+
+        # ─── всё остальное — только с активной сессией ───
+        if not self._is_authorized(message):
             await self._deny(message)
             return
 
-        args = (utils.get_args_raw(message) or "").strip()
         if not args:
             active_chats = []
             for cid in self._chat_order[-10:]:
@@ -966,21 +1519,20 @@ class AIMod(loader.Module):
             await utils.answer(
                 message,
                 "👑 <b>Панель создателя</b>\n\n"
-                f"  • <b>Режим техрежима:</b> {'🛠 ВКЛ' if self._maintenance else '✅ выкл'}\n"
+                f"  • <b>Техрежим:</b> {'🛠 ВКЛ' if self._maintenance else '✅ выкл'}\n"
                 f"  • <b>Активных чатов:</b> {len(self._chat_order)}\n"
                 f"  • <b>Забанено:</b> {len(self._banned)}\n"
                 f"  • <b>Тихих банов:</b> {len(self._silent_banned)}\n"
                 f"  • <b>Заглушено чатов:</b> {len(self._gagged_chats)}\n"
                 f"  • <b>Заглушено юзеров:</b> {len(self._gagged_users)}\n"
-                f"  • <b>Триггер 🌳:</b> {'вкл' if self._tree_enabled else 'выкл'}\n\n"
+                f"  • <b>Триггер 🌳:</b> {'вкл' if self._tree_enabled else 'выкл'}\n"
+                f"  • <b>Белый список:</b> {'вкл 🔒' if self.config['whitelist_enabled'] else 'выкл 🔓'} "
+                f"({len(self._whitelist_chats)})\n"
+                f"  • <b>Кэш:</b> {'вкл' if self.config['cache_enabled'] else 'выкл'} ({len(self._cache)})\n\n"
                 "📋 <b>Последние чаты:</b>\n" + ("\n".join(active_chats) or "  • —") + "\n\n"
                 + self._help_admin(),
             )
             return
-
-        parts = args.split(maxsplit=1)
-        sub = parts[0].lower()
-        rest = parts[1].strip() if len(parts) > 1 else ""
 
         if sub == "ban":
             await self._admin_ban(message, rest)
@@ -998,19 +1550,74 @@ class AIMod(loader.Module):
             await self._admin_gag(message, rest)
         elif sub == "ungag":
             await self._admin_ungag(message, rest)
+        elif sub == "allow":
+            self._whitelist_chats.add(message.chat_id)
+            self._save_state()
+            await utils.answer(
+                message,
+                f"✅ Чат добавлен в белый список.\n"
+                f"<b>ID:</b> <code>{message.chat_id}</code>\n"
+                f"<b>Всего:</b> {len(self._whitelist_chats)}",
+            )
+        elif sub == "disallow":
+            self._whitelist_chats.discard(message.chat_id)
+            self._save_state()
+            await utils.answer(
+                message,
+                f"🚫 Чат удалён из белого списка.\n<b>ID:</b> <code>{message.chat_id}</code>",
+            )
+        elif sub == "allowlist":
+            if not self._whitelist_chats:
+                await utils.answer(message, "📋 Белый список пуст.")
+                return
+            lines = [f"📋 <b>Белый список</b> ({len(self._whitelist_chats)})\n"]
+            for cid in self._whitelist_chats:
+                try:
+                    chat = await self._client.get_entity(cid)
+                    title = getattr(chat, "title", None) or "Личный чат"
+                except Exception:
+                    title = "?"
+                lines.append(f"  • <code>{cid}</code> — {html.escape(title)}")
+            await utils.answer(message, "\n".join(lines))
+        elif sub == "allow_all":
+            count = len(self._whitelist_chats)
+            self._whitelist_chats.clear()
+            self._save_state()
+            await utils.answer(message, f"✅ Белый список очищен (<b>{count}</b>).")
+        elif sub == "whitelist":
+            self.config["whitelist_enabled"] = not self.config["whitelist_enabled"]
+            status = "вкл 🔒" if self.config["whitelist_enabled"] else "выкл 🔓"
+            await utils.answer(
+                message,
+                f"<b>Белый список: {status}</b>\n<i>В списке:</i> <b>{len(self._whitelist_chats)}</b>",
+            )
+        elif sub == "cache":
+            await self._admin_cache(message)
+        elif sub == "cache_toggle":
+            self.config["cache_enabled"] = not self.config["cache_enabled"]
+            status = "вкл ✅" if self.config["cache_enabled"] else "выкл ⛔"
+            await utils.answer(
+                message,
+                f"<b>Кэш: {status}</b>\n<i>Записей:</i> <b>{len(self._cache)}</b>",
+            )
+        elif sub == "cache_clear":
+            count = len(self._cache)
+            self._cache.clear()
+            self._save_cache()
+            await utils.answer(message, f"🗑 Кэш очищен. Удалено записей: <b>{count}</b>.")
         elif sub == "tree":
             self._tree_enabled = not self._tree_enabled
             self._save_state()
             await utils.answer(message, f"🌳 Триггер {'включён' if self._tree_enabled else 'выключен'}.")
+        elif sub == "vision":
+            self.config["vision_enabled"] = not self.config["vision_enabled"]
+            status = "вкл" if self.config["vision_enabled"] else "выкл"
+            await utils.answer(message, f"👀 Vision {status}.")
         elif sub == "maintenance":
             self._maintenance = not self._maintenance
             self._save_state()
             status = "🛠 включён" if self._maintenance else "✅ выключен"
-            await utils.answer(
-                message,
-                f"<b>Режим техобслуживания {status}.</b>\n"
-                f"<i>Бот {'не будет' if self._maintenance else 'снова будет'} отвечать.</i>",
-            )
+            await utils.answer(message, f"<b>Режим техобслуживания {status}.</b>")
         elif sub == "broadcast":
             await self._admin_broadcast(message, rest)
         elif sub == "announce":
@@ -1035,11 +1642,6 @@ class AIMod(loader.Module):
             await self._admin_top5(message)
         elif sub == "export_all":
             await self._admin_export_all(message)
-        elif sub == "vision":
-            # Быстрый переключатель vision
-            self.config["vision_enabled"] = not self.config["vision_enabled"]
-            status = "вкл" if self.config["vision_enabled"] else "выкл"
-            await utils.answer(message, f"👀 Vision {status}.")
         else:
             await utils.answer(
                 message,
@@ -1047,7 +1649,34 @@ class AIMod(loader.Module):
                 + self._help_admin(),
             )
 
-    # ─── АДМИН-МЕТОДЫ ───
+    async def _admin_cache(self, message):
+        ttl = int(self.config["cache_ttl_hours"])
+        max_size = int(self.config["cache_max_size"])
+        now = time.time()
+        expired = sum(1 for v in self._cache.values() if now - v.get("ts", 0) > ttl * 3600)
+        if self._cache:
+            ts_list = [v.get("ts", 0) for v in self._cache.values()]
+            oldest = time.time() - min(ts_list)
+            newest = time.time() - max(ts_list)
+            oldest_str = f"{oldest/3600:.1f} ч назад"
+            newest_str = f"{newest/60:.0f} мин назад"
+        else:
+            oldest_str = newest_str = "—"
+        await utils.answer(
+            message,
+            "💾 <b>Кэш ответов</b>\n\n"
+            f"  • <b>Статус:</b> {'вкл ✅' if self.config['cache_enabled'] else 'выкл ⛔'}\n"
+            f"  • <b>Записей:</b> {len(self._cache)} / {max_size}\n"
+            f"  • <b>TTL:</b> {ttl} ч\n"
+            f"  • <b>Просрочено:</b> {expired}\n"
+            f"  • <b>Самый старый:</b> {oldest_str}\n"
+            f"  • <b>Самый свежий:</b> {newest_str}\n"
+            f"  • <b>Cache hits:</b> {self._stats.get('cache_hits', 0)}\n\n"
+            "<b>Команды:</b>\n"
+            "  • <code>.aiadmin cache_toggle</code> — вкл/выкл\n"
+            "  • <code>.aiadmin cache_clear</code> — очистить",
+        )
+
     async def _resolve_user(self, message, args):
         if not args:
             reply = await message.get_reply_message()
@@ -1158,6 +1787,7 @@ class AIMod(loader.Module):
             try:
                 messages = [{"role": "user", "content": args}]
                 answer = await self._ask_ai(messages)
+                answer = self._sanitize_ai_output(answer)
                 await self._client.send_message(cid, answer)
                 sent += 1
             except Exception:
@@ -1187,6 +1817,7 @@ class AIMod(loader.Module):
             entity = await message.client.get_entity(target)
             messages = [{"role": "user", "content": text}]
             answer = await self._ask_ai(messages)
+            answer = self._sanitize_ai_output(answer)
             await self._client.send_message(entity.id, answer)
             await utils.answer(message, f"✉️ Отправлено <b>{html.escape(target)}</b>.")
         except Exception as e:
@@ -1241,6 +1872,7 @@ class AIMod(loader.Module):
         msg_count = self._user_msg_count.get(str(uid), 0)
         gag_list = self._gagged_users.get(str(uid), [])
         gag_str = f"{len(gag_list)} чат(ов)" if gag_list else "—"
+        notes = self._get_user_notes(uid)
         await utils.answer(
             message,
             "👤 <b>Карточка пользователя</b>\n\n"
@@ -1250,6 +1882,7 @@ class AIMod(loader.Module):
             f"  • <b>Бан:</b> {ban_status}\n"
             f"  • <b>Заглушек:</b> {gag_str}\n"
             f"  • <b>Личный характер:</b> <i>{html.escape(personal[:150]) if personal else '—'}</i>\n"
+            f"  • <b>Фактов в памяти:</b> {len(notes)}\n"
             f"  • <b>Сообщений AI:</b> {msg_count}",
         )
 
@@ -1276,24 +1909,36 @@ class AIMod(loader.Module):
         except Exception:
             global_prompt = None
         user_prompts = {}
+        user_notes = {}
         for uid_str in self._user_msg_count.keys():
             try:
                 p = self.db.get("AI", f"user_prompt_{uid_str}", None)
                 if p:
                     user_prompts[uid_str] = p
+                n = self.db.get("AI", f"user_notes_{uid_str}", None)
+                if n:
+                    user_notes[uid_str] = n
             except Exception:
                 pass
         data = {
-            "version": "1.0", "exported_at": time.time(), "creator": self.CREATOR_USERNAME,
+            "version": "1.5", "exported_at": time.time(), "creator": self.CREATOR_USERNAME,
             "history": {str(k): v for k, v in self._history.items()},
             "banned": list(self._banned), "silent_banned": list(self._silent_banned),
             "gagged_chats": list(self._gagged_chats), "gagged_users": self._gagged_users,
+            "whitelist_chats": list(self._whitelist_chats),
+            "cache": self._cache,
             "global_prompt": global_prompt, "user_prompts": user_prompts,
+            "user_notes": user_notes,
             "user_msg_count": self._user_msg_count, "stats": self._stats,
             "settings": {
                 "provider": self.config["provider"], "model": self.config["model"],
                 "vision_model": self.config["vision_model"],
                 "vision_enabled": self.config["vision_enabled"],
+                "whitelist_enabled": self.config["whitelist_enabled"],
+                "use_notes": self.config["use_notes"],
+                "cache_enabled": self.config["cache_enabled"],
+                "cache_ttl_hours": self.config["cache_ttl_hours"],
+                "sanitize_output": self.config["sanitize_output"],
                 "temperature": self.config["temperature"], "max_tokens": self.config["max_tokens"],
                 "history_size": self.config["history_size"], "summary_size": self.config["summary_size"],
             },
@@ -1303,10 +1948,11 @@ class AIMod(loader.Module):
         file.name = f"ai_full_dump_{int(time.time())}.json"
         await message.client.send_file(message.chat_id, file, caption="📦 Полный дамп AI-модуля")
 
-    # ─── Watcher ───
     @loader.watcher(only_messages=True)
     async def watcher(self, message):
-        if not message.raw_text and not (message.photo or message.sticker or message.gif or message.video):
+        if not message.raw_text and not (
+            message.photo or message.sticker or message.gif or message.video
+        ):
             return
         if message.sender_id == self._me.id:
             return
@@ -1320,13 +1966,14 @@ class AIMod(loader.Module):
             return
         if self._is_user_gagged(message.sender_id, message.chat_id):
             return
+        if not self._whitelist_ok(message):
+            return
 
         uid_str = str(message.sender_id)
         self._user_msg_count[uid_str] = self._user_msg_count.get(uid_str, 0) + 1
 
         raw_text = message.raw_text or ""
 
-        # 🌳 Триггер создателя
         if self._tree_enabled and self.TREE_EMOJI in raw_text:
             if message.sender_id == self.CREATOR_ID:
                 if message.id in self._tree_replied:
@@ -1335,7 +1982,6 @@ class AIMod(loader.Module):
                 await utils.answer(message, self.TREE_RESPONSE)
                 return
 
-        # Авто-реакции
         if self.config["auto_reactions"] and raw_text:
             reaction = self._pick_reaction(raw_text)
             if reaction:
@@ -1344,11 +1990,9 @@ class AIMod(loader.Module):
                 except Exception:
                     pass
 
-        # Команды не обрабатываем
         if raw_text.startswith((".", "/", "!")):
             return
 
-        # Авто-ответ на упоминание / триггер
         text_lower = raw_text.lower()
         my_username = (self._me.username or "").lower()
         trigger = (self.config["reply_to_trigger"] or "").lower().strip()
@@ -1361,20 +2005,25 @@ class AIMod(loader.Module):
                 triggered = True
 
         if mentioned or triggered:
-            # Если у самого сообщения есть медиа — используем vision
-            if self.config["vision_enabled"] and (message.photo or message.sticker or message.gif or message.video):
+            if self.config["vision_enabled"] and (
+                message.photo or message.sticker or message.gif or message.video
+            ):
                 answer = await self._ask_ai_vision(message, raw_text, message)
             else:
-                user_prompt = self._get_user_prompt(message.sender_id)
+                user_prompt = self._get_user_prompt_with_notes(message.sender_id)
                 final_text = await self._build_user_message(message, raw_text)
                 self._add_to_history(message.chat_id, "user", final_text)
-                messages = [{"role": "system", "content": user_prompt}] + self._get_history(message.chat_id)
-                answer = await self._ask_ai(messages, use_history_chat_id=message.chat_id)
+                messages = [
+                    {"role": "system", "content": user_prompt}
+                ] + self._get_history(message.chat_id)
+                answer = await self._ask_ai(
+                    messages, use_history_chat_id=message.chat_id
+                )
+            answer = self._sanitize_ai_output(answer)
             await utils.answer(message, answer)
             self._save_state()
             return
 
-        # Режим диалога — только если в истории есть чат
         if message.chat_id not in self._history:
             return
         if self.config["reply_only_when_mentioned"] and not (mentioned or triggered):
@@ -1385,12 +2034,18 @@ class AIMod(loader.Module):
         if not reply or reply.sender_id != self._me.id:
             return
 
-        # В диалоге картинки от пользователя тоже обрабатываем
-        if self.config["vision_enabled"] and (message.photo or message.sticker or message.gif or message.video):
+        if self.config["vision_enabled"] and (
+            message.photo or message.sticker or message.gif or message.video
+        ):
             answer = await self._ask_ai_vision(message, raw_text, message)
         else:
-            user_prompt = self._get_user_prompt(message.sender_id)
+            user_prompt = self._get_user_prompt_with_notes(message.sender_id)
             self._add_to_history(message.chat_id, "user", raw_text)
-            messages = [{"role": "system", "content": user_prompt}] + self._get_history(message.chat_id)
-            answer = await self._ask_ai(messages, use_history_chat_id=message.chat_id)
+            messages = [
+                {"role": "system", "content": user_prompt}
+            ] + self._get_history(message.chat_id)
+            answer = await self._ask_ai(
+                messages, use_history_chat_id=message.chat_id
+            )
+        answer = self._sanitize_ai_output(answer)
         await utils.answer(message, answer)
