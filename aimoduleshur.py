@@ -154,7 +154,25 @@ class AIMod(loader.Module):
                 "Убирать 'thinking', 'analysis' и служебные префиксы из ответов AI.",
                 validator=loader.validators.Boolean(),
             ),
+            loader.ConfigValue(
+                "auto_memory", True,
+                "AI сам запоминает факты о пользователях из их сообщений.",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "auto_memory_prompt",
+                "Ты — экстрактор фактов. Прочитай сообщение пользователя и выпиши "
+                "ЛЮБЫЕ факты о нём (имя, работа, увлечения, город, питомцы, предпочтения). "
+                "Формат строго:\n"
+                "- <факт 1>\n"
+                "- <факт 2>\n\n"
+                "Если фактов нет — ответь ровно: НЕТ\n"
+                "Не пиши ничего кроме списка фактов или слова НЕТ.",
+                "Инструкция для извлечения фактов.",
+                validator=loader.validators.String(),
+            ),
         )
+        
         self._history = {}
         self._tree_replied = set()
         self._chat_order = []
@@ -261,6 +279,18 @@ class AIMod(loader.Module):
         if not self.CREATOR_ID:
             self.CREATOR_ID = self._me.id
         self._load_from_db()
+        # при перезагрузке всегда восстанавливаем список включённых режимов
+        try:
+            chat_ids = self.db.get("AI", "chat_ids", []) or []
+            self._chat_order = []
+            self._history = {}
+            for cid in chat_ids:
+                cid_int = int(cid)
+                hist = self.db.get("AI", f"history_{cid}", []) or []
+                self._history[cid_int] = hist
+                self._chat_order.append(cid_int)
+        except Exception:
+            pass
         if self.config["diary_enabled"] and self._diary_task is None:
             self._diary_task = asyncio.create_task(self._diary_loop())
 
@@ -350,11 +380,16 @@ class AIMod(loader.Module):
         return chat_id in chats
 
     def _whitelist_ok(self, message):
-        if not self.config["whitelist_enabled"]:
-            return True
+        # Создатель всегда в обход всех проверок
         if message.sender_id == self.CREATOR_ID:
             return True
-        return message.chat_id in self._whitelist_chats
+        # Режим диалога в чате должен быть включён (кем угодно, обычно тобой)
+        if message.chat_id not in self._history:
+            return False
+        # Если включён ещё и whitelist — проверяем его
+        if self.config["whitelist_enabled"]:
+            return message.chat_id in self._whitelist_chats
+        return True
 
     def _get_history(self, chat_id):
         return self._history.get(chat_id, [])
@@ -416,6 +451,45 @@ class AIMod(loader.Module):
             return ""
         lines = "\n".join(f"  - {n}" for n in notes)
         return f"\n\nЧто известно об этом пользователе:\n{lines}\nУчитывай это, но не перечисляй в ответе явно."
+
+    async def _extract_and_save_facts(self, user_id: int, text: str):
+        """Фоново извлекает факты из сообщения и сохраняет в память."""
+        if not self.config["auto_memory"]:
+            return
+        if not text or len(text.strip()) < 10:
+            return
+        try:
+            messages = [
+                {"role": "system", "content": self.config["auto_memory_prompt"]},
+                {"role": "user", "content": text[:1500]},
+            ]
+            reply = await self._ask_ai(messages)
+            if not reply:
+                return
+            cleaned = re.sub(r"<[^>]+>", "", reply).strip()
+            if not cleaned or cleaned.upper().startswith("НЕТ"):
+                return
+            new_facts = []
+            for line in cleaned.splitlines():
+                line = line.strip()
+                if line.startswith(("-", "•", "*")):
+                    fact = line.lstrip("-•* ").strip()
+                    if 3 < len(fact) < 200:
+                        new_facts.append(fact)
+            if not new_facts:
+                return
+            existing = self._get_user_notes(user_id)
+            existing_lower = {e.lower().strip() for e in existing}
+            added = 0
+            for fact in new_facts[:5]:
+                if fact.lower().strip() not in existing_lower:
+                    existing.append(fact)
+                    existing_lower.add(fact.lower().strip())
+                    added += 1
+            if added > 0:
+                self._save_user_notes(user_id, existing[-50:])
+        except Exception:
+            pass
 
     def _get_user_prompt_with_notes(self, uid):
         return self._get_user_prompt(uid) + self._notes_block(uid)
@@ -776,6 +850,7 @@ class AIMod(loader.Module):
         await utils.answer(message, "🤔 <i>Думаю…</i>")
         answer = await self._ask_ai(messages, use_history_chat_id=message.chat_id)
         await utils.answer(message, self._sanitize_ai_output(answer))
+        asyncio.create_task(self._extract_and_save_facts(message.sender_id, text))
 
     async def _do_ocr(self, message, args):
         reply = await message.get_reply_message()
@@ -976,17 +1051,31 @@ class AIMod(loader.Module):
         await utils.answer(message, "🕐 <b>Хронология</b>\n\n" + "\n".join(lines))
 
     async def _do_toggle(self, message):
+        if message.sender_id != self.CREATOR_ID:
+            await utils.answer(message, "🔒 Только создатель может включать режим диалога.")
+            return
         chat_id = message.chat_id
         if chat_id in self._history:
             del self._history[chat_id]
             if chat_id in self._chat_order:
                 self._chat_order.remove(chat_id)
-            await utils.answer(message, "🔇 Режим выключен.")
+            if self.config["save_history_to_db"]:
+                try:
+                    self.db.set("AI", f"history_{chat_id}", [])
+                except Exception:
+                    pass
+            await utils.answer(message, "🔇 Режим диалога выключен. Бот молчит в этом чате.")
         else:
             self._history[chat_id] = []
             if chat_id not in self._chat_order:
                 self._chat_order.append(chat_id)
-            await utils.answer(message, "🔊 Режим включён.")
+            # сохраняем пустой список — так при перезагрузке режим восстановится
+            try:
+                self.db.set("AI", f"history_{chat_id}", [])
+                self.db.set("AI", "chat_ids", self._chat_order)
+            except Exception:
+                pass
+            await utils.answer(message, "🔊 Режим диалога включён. Бот отвечает в этом чате.")
 
     async def _do_reset(self, message):
         self._history[message.chat_id] = []
@@ -1372,9 +1461,48 @@ class AIMod(loader.Module):
         await self._do_forget(message, utils.get_args_raw(message) or "")
 
     @loader.command()
-    async def ainotes(self, message):
-        """Показать факты о пользователе. .ainotes [@user]"""
-        await self._do_notes(message, utils.get_args_raw(message) or "")
+    async def aimemory(self, message):
+        """Показать, что AI запомнил о тебе (или о другом). .aimemory [@user]"""
+        args = (utils.get_args_raw(message) or "").strip()
+        target_uid = message.sender_id
+        display = "тебе"
+        if args:
+            try:
+                entity = await message.client.get_entity(
+                    int(args) if args.lstrip("-").isdigit() else args
+                )
+                target_uid = entity.id
+                display = html.escape(getattr(entity, "first_name", None) or str(target_uid))
+            except Exception:
+                await utils.answer(message, "❌ Не нашёл.")
+                return
+        notes = self._get_user_notes(target_uid)
+        if not notes:
+            await utils.answer(message, f"📭 AI пока ничего не запомнил о {display}.")
+            return
+        lines = [f"🧠 <b>AI помнит</b> о {display} <i>({len(notes)})</i>:\n"]
+        for i, n in enumerate(notes, 1):
+            lines.append(f"  {i}. {html.escape(n)}")
+        lines.append("\n<i>Удалить: .aiforget [@user] N</i>")
+        await utils.answer(message, "\n".join(lines))
+
+    @loader.command()
+    async def aimemory_off(self, message):
+        """[Создатель] Выключить авто-память"""
+        if message.sender_id != self.CREATOR_ID:
+            await utils.answer(message, "🔒 Только для создателя.")
+            return
+        self.config["auto_memory"] = False
+        await utils.answer(message, "🧠 Авто-память <b>выключена</b>.")
+
+    @loader.command()
+    async def aimemory_on(self, message):
+        """[Создатель] Включить авто-память"""
+        if message.sender_id != self.CREATOR_ID:
+            await utils.answer(message, "🔒 Только для создателя.")
+            return
+        self.config["auto_memory"] = True
+        await utils.answer(message, "🧠 Авто-память <b>включена</b>.")
 
     @loader.command()
     async def aiwhitelist(self, message):
